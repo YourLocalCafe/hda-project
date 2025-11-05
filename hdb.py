@@ -414,25 +414,56 @@ class TaxaClassifier:
         
         return predictions.cpu().numpy(), probabilities.cpu().numpy()
     
-    def predict_with_confidence(self, embeddings, confidence_threshold=0.5):
+    def predict_with_confidence(self, embeddings, confidence_threshold=0.5, batch_size=128):
         """
-        Predict with confidence-based unknown detection
+        Predict with confidence-based unknown detection (BATCHED)
         
         Args:
             embeddings: (N, D) array of embeddings
             confidence_threshold: Minimum confidence for known classification
+            batch_size: Batch size for inference (can be larger than train)
             
         Returns:
             predictions: (N,) array (-1 for unknown/low confidence)
             confidences: (N,) array of max probabilities
         """
-        predictions, probabilities = self.predict(embeddings)
-        confidences = probabilities.max(axis=1)
+        self.model.eval()
         
-        # Mark low-confidence predictions as unknown
-        predictions[confidences < confidence_threshold] = -1
+        # Create dataset and loader
+        dataset = TensorDataset(torch.FloatTensor(embeddings))
+        # Use a larger batch size for inference, as it doesn't need to store gradients
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=False) 
         
-        return predictions, confidences
+        all_predictions = []
+        all_confidences = []
+        
+        tqdm.write(f"Running batched inference (batch_size={batch_size})...")
+        
+        with torch.no_grad():
+            # Add progress bar for inference
+            for (embeddings_batch,) in tqdm(loader, desc="Predicting", leave=False, file=sys.stdout): 
+                embeddings_batch = embeddings_batch.to(self.device)
+                
+                # Get model outputs
+                outputs = self.model(embeddings_batch)
+                
+                # Get probabilities and predictions
+                probabilities = torch.softmax(outputs, dim=1)
+                confidences_batch, predictions_batch = probabilities.max(dim=1)
+                
+                # Mark low-confidence predictions as unknown (-1)
+                # We can't use -1 in a LongTensor, so we use a float tensor
+                predictions_float = predictions_batch.to(torch.float32)
+                predictions_float[confidences_batch < confidence_threshold] = -1
+                
+                all_predictions.append(predictions_float.cpu())
+                all_confidences.append(confidences_batch.cpu())
+        
+        # Concatenate all batch results
+        final_predictions = torch.cat(all_predictions).numpy().astype(int)
+        final_confidences = torch.cat(all_confidences).numpy()
+        
+        return final_predictions, final_confidences
 
 # ==================== Full Pipeline ====================
 
@@ -610,7 +641,7 @@ def main():
             sys.exit("Exiting due to data preparation error.") # Exit script
         
         # Train
-        history = classifier.train(train_loader, test_loader, num_epochs=30)
+        history = classifier.train(train_loader, test_loader, num_epochs=100)
         
         # Save model
         torch.save(classifier.model.state_dict(), 'taxa_classifier.pt')
